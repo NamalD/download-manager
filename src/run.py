@@ -79,6 +79,10 @@ ui_style = Style.from_dict({
     'modal-highlight': 'bg:ansiblue fg:white', # Cursor highlight
     'modal-selected': 'fg:ansigreen bold', # Selection marker
     'modal-unselected': 'fg:gray',       # Selection marker
+    
+    # Speed
+    'speed': 'fg:ansimagenta',
+    'eta': 'fg:ansiyellow',
 })
 
 # --- UI Content Functions ---
@@ -90,21 +94,67 @@ def format_size(byte_size: int) -> str:
     if byte_size < 1024**3: return f"{byte_size/(1024**2):.2f} MB"
     return f"{byte_size/(1024**3):.2f} GB"
 
-# --- Main Download List Content ---
+def format_speed_rate(bps: float) -> str:
+    """ Formats bytes per second into a human-readable rate. """
+    if bps < 1024: return f"{bps:.0f} B/s"
+    if bps < 1024**2: return f"{bps/1024:.1f} KB/s"
+    if bps < 1024**3: return f"{bps/(1024**2):.2f} MB/s"
+    return f"{bps/(1024**3):.2f} GB/s"
+
+def format_eta(seconds: Optional[float]) -> str:
+    """ Formats seconds into a human-readable ETA string (d, h, m, s). """
+    if seconds is None or seconds < 0:
+        return "N/A"
+    if seconds == 0:
+         return "Done" # Or "" ?
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}m {s}s"
+    if seconds < 86400: # Less than a day
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+    # Over a day
+    d = int(seconds // 86400)
+    h = int((seconds % 86400) // 3600)
+    return f"{d}d {h}h"
+
+
 def create_manual_progress_bar_tuples(index: int, item: DownloadItem) -> List[Tuple[str, str]]:
-    # (Unchanged)
+    """ Creates tuples for ONE line representing a progress bar, including index, speed, and ETA. """
     percentage = 0.0
-    if item.total_size > 0: percentage = min(100.0, (item.downloaded_size / item.total_size) * 100)
+    if item.total_size > 0:
+        percentage = min(100.0, (item.downloaded_size / item.total_size) * 100)
+
     filled_width = int(PROGRESS_BAR_WIDTH * percentage / 100)
     empty_width = max(0, PROGRESS_BAR_WIDTH - filled_width)
+
     size_str = f"{format_size(item.downloaded_size)}/{format_size(item.total_size)}" if item.total_size > 0 else f"{format_size(item.downloaded_size)}"
     percent_str = f"{percentage:.1f}%"
+
+    # --- Get Speed and ETA ---
+    speed_str = format_speed_rate(item.current_speed)
+    eta_str = format_eta(item.eta_seconds)
+
     line_tuples = [
         ('class:item-index', f"{index:>2}: "),
-        ('class:filename', item.filename), ('', ' ['),
-        ('class:progress-bar-filled', '━' * filled_width), ('class:progress-bar', ' ' * empty_width),
-        ('', '] '), ('class:percentage', percent_str), ('', ' '), ('class:size', f"({size_str})"),
-        ('', '\n')]
+        ('class:filename', item.filename),
+        ('', ' ['),
+        ('class:progress-bar-filled', '━' * filled_width),
+        ('class:progress-bar', ' ' * empty_width),
+        ('', '] '),
+        ('class:percentage', percent_str),
+        ('', ' '),
+        ('class:speed', f"{speed_str:<10}"), # Add speed, pad for alignment
+        ('', ' '),
+        ('class:eta', f"ETA: {eta_str:<8}"), # Add ETA, pad
+        ('', ' '),
+        ('class:size', f"({size_str})"),
+        ('', '\n')
+    ]
     return line_tuples
 
 def get_download_list_content() -> List[Tuple[str, str]]:
@@ -112,7 +162,7 @@ def get_download_list_content() -> List[Tuple[str, str]]:
     global last_exception
     all_lines: List[Tuple[str, str]] = []
     try:
-        items = sorted(manager.get_items(), key=lambda x: x.filename)
+        items = manager.get_items()
         if not items: all_lines.append(('', "No downloads yet. [a]dd URL or [A]dd from Real-Debrid.\n"))
         else:
             for idx, item in enumerate(items, start=1):
@@ -175,8 +225,6 @@ input_buffer = Buffer()
 # --- Key Bindings ---
 # Main bindings (when not in modal or text input)
 main_bindings = KeyBindings()
-# Modal specific bindings
-rd_modal_bindings = KeyBindings()
 
 # --- Helper Functions ---
 def reset_text_input_state(app_layout):
@@ -344,6 +392,9 @@ def _(event):
 # --- Real-Debrid Modal Bindings ---
 # These bindings are only active when rd_modal_active is True
 rd_modal_filter = Condition(lambda: rd_modal_active)
+
+# Modal specific bindings
+rd_modal_bindings = KeyBindings()
 
 @rd_modal_bindings.add('escape', filter=rd_modal_filter)
 @rd_modal_bindings.add('q', filter=rd_modal_filter)

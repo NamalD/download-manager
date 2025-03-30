@@ -44,6 +44,12 @@ class DownloadItem:
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
 
+        self.start_time: Optional[float] = None # Time when download activity last started/resumed
+        self.last_speed_calc_time: float = 0.0  # Time of the last speed calculation
+        self.bytes_at_last_calc: int = 0      # downloaded_size at the last speed calculation
+        self.current_speed: float = 0.0       # Bytes per second
+        self.eta_seconds: Optional[float] = None  # Estimated seconds remaining
+
     def _generate_filename(self, url):
         try:
             parsed_url = urlparse(url)
@@ -253,6 +259,9 @@ class DownloadManager:
         with self.lock:
              item.status = 'downloading'
              item.error_message = None
+             item.current_speed = 0.0
+             item.eta_seconds = None
+             item.start_time = None
              item.pause_event.clear()
 
         headers = {}
@@ -260,6 +269,7 @@ class DownloadManager:
         file_mode = 'wb'
         session = requests.Session()
         response = None
+        speed_calc_interval = 1.0 # Recalculate speed every second
 
         try:
             # --- Resume Logic ---
@@ -322,11 +332,19 @@ class DownloadManager:
             last_progress_save_time = time.time()
             os.makedirs(os.path.dirname(item.temp_filename), exist_ok=True)
 
+            # ** Initialize speed tracking when download starts/resumes **
+            initial_byte_count = item.downloaded_size
+            item.start_time = time.time()
+            item.last_speed_calc_time = item.start_time
+            item.bytes_at_last_calc = initial_byte_count
+
             with open(item.temp_filename, file_mode) as f:
                 if file_mode == 'ab': f.seek(current_size)
 
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if not chunk: continue
+                    
+                    current_loop_time = time.time() # Use consistent time for calcs in loop
 
                     # --- Check for Pause/Stop ---
                     should_stop = False
@@ -354,15 +372,43 @@ class DownloadManager:
                             item.downloaded_size = final_size
                             with open(item.progress_file, 'w') as pf: pf.write(str(final_size))
                             logging.info(f"Saved progress ({final_size} bytes) for {item.filename} before stopping.")
-                            # print(f"Saved progress ({final_size} bytes) for {item.filename} before stopping.") # REMOVED
+                            
+                            ## Reset speed/ETA on pause/stop
+                            item.current_speed = 0.0
+                            item.eta_seconds = None 
                         except IOError as e:
                              logging.error(f"Error saving progress for {item.filename} on stop: {e}")
                              # print(f"\nError saving progress for {item.filename} on stop: {e}") # REMOVED
                         return # Exit _process_download
 
                     # --- Write Chunk & Update Progress ---
+                    chunk_len = len(chunk)
                     f.write(chunk)
-                    item.downloaded_size += len(chunk)
+                    item.downloaded_size += chunk_len
+
+                    # --- Calculate Speed & ETA ---
+                    if current_loop_time - item.last_speed_calc_time >= speed_calc_interval:
+                        time_delta = current_loop_time - item.last_speed_calc_time
+                        bytes_delta = item.downloaded_size - item.bytes_at_last_calc
+
+                        if time_delta > 0:
+                            item.current_speed = bytes_delta / time_delta
+                        else:
+                            item.current_speed = 0.0 # Avoid division by zero
+
+                        # Calculate ETA
+                        if item.total_size > 0 and item.current_speed > 1: # Avoid near-zero speed ETA spikes
+                            remaining_bytes = item.total_size - item.downloaded_size
+                            if remaining_bytes > 0:
+                                item.eta_seconds = remaining_bytes / item.current_speed
+                            else:
+                                item.eta_seconds = 0 # Already finished technically
+                        else:
+                            item.eta_seconds = None # Cannot estimate
+
+                        # Update trackers for next calculation
+                        item.last_speed_calc_time = current_loop_time
+                        item.bytes_at_last_calc = item.downloaded_size
 
                     # --- Save progress periodically ---
                     current_time = time.time()
@@ -377,9 +423,10 @@ class DownloadManager:
 
             # --- Download Complete ---
             logging.info(f"Download stream finished for {item.filename}.")
-            # print(f"\nDownload stream finished for {item.filename}.") # REMOVED
             final_downloaded_size = os.path.getsize(item.temp_filename)
             item.downloaded_size = final_downloaded_size
+            item.current_speed = 0.0 # Reset speed/ETA on completion
+            item.eta_seconds = None
 
             if item.total_size > 0 and final_downloaded_size != item.total_size:
                 raise IOError(f"Incomplete: Expected {item.total_size}, got {final_downloaded_size}")
@@ -397,6 +444,11 @@ class DownloadManager:
             logging.error(f"Download Error ({item.filename}): {e}")
             # print(f"\nDownload Error ({item.filename}): {e}") # REMOVED
             with self.lock: item.status = 'error'; item.error_message = str(e)
+            
+            # Reset speed and ETA on error
+            item.current_speed = 0.0; 
+            item.eta_seconds = None
+
             if item.downloaded_size > 0: # Save progress on network errors
                 try:
                     with open(item.progress_file, 'w') as pf: pf.write(str(item.downloaded_size))
@@ -405,14 +457,24 @@ class DownloadManager:
             logging.error(f"File I/O Error ({item.filename}): {e}")
             # print(f"\nFile I/O Error ({item.filename}): {e}") # REMOVED
             with self.lock: item.status = 'error'; item.error_message = f"File I/O Error: {e}"
+
+            # Reset speed and ETA on error
+            item.current_speed = 0.0; 
+            item.eta_seconds = None
+
         except Exception as e:
             logging.exception(f"Unexpected Error ({item.filename}): {e}") # Log full traceback
-            # print(f"\nUnexpected Error ({item.filename}): {e}") # REMOVED
+            
+            # Reset speed and ETA on error
+            item.current_speed = 0.0; 
+            item.eta_seconds = None
+
             with self.lock: item.status = 'error'; item.error_message = f"Unexpected Error: {e}"
             if item.downloaded_size > 0: # Try save progress
                  try:
                       with open(item.progress_file, 'w') as pf: pf.write(str(item.downloaded_size))
                  except IOError as ioe: logging.error(f"Could not save progress during error ({item.filename}): {ioe}")
+
         finally:
             if response: response.close()
 
