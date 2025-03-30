@@ -7,14 +7,28 @@ import json
 import signal
 import sys
 from urllib.parse import urlparse
+import logging # Import logging
 
 # --- Configuration ---
 CHUNK_SIZE = 8192
 DOWNLOAD_DIR = "downloads"
 STATE_FILE = "download_state.json"
+LOG_FILE = "downloader.log" # Optional log file
 
-# --- Download Item Class ---
+# --- Setup Logging (Optional, but recommended over print) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
+    filename=LOG_FILE,
+    filemode='a' # Append to the log file
+)
+# You might want to disable logging propagation to root logger if it outputs to console
+# logging.getLogger().propagate = False
+
+
+# --- Download Item Class (No changes needed here) ---
 class DownloadItem:
+    # ... (no print statements here usually) ...
     def __init__(self, url, filename=None, total_size=0, downloaded_size=0, status='queued', error_message=None):
         self.url = url
         self.filename = filename or self._generate_filename(url)
@@ -24,7 +38,6 @@ class DownloadItem:
 
         self.total_size = total_size
         self.downloaded_size = downloaded_size
-        # Ensure status is valid on init, default to queued if not
         valid_statuses = ['queued', 'downloading', 'paused', 'completed', 'error']
         self.status = status if status in valid_statuses else 'queued'
         self.error_message = error_message
@@ -36,12 +49,12 @@ class DownloadItem:
             parsed_url = urlparse(url)
             filename = os.path.basename(parsed_url.path)
             if not filename:
-                return f"download_{hash(url)}.unknown"
-            # Basic sanitization (replace potentially problematic chars)
-            # A more robust solution might use a library like `pathvalidate`
-            filename = filename.replace('/', '_').replace('\\', '_').replace(':', '_')
+                filename = f"download_{hash(url)}.unknown"
+            # Basic sanitization
+            filename = filename.replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('*', '_')
             return filename
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error generating filename for {url}: {e}")
             return f"download_{hash(url)}.unknown"
 
     def to_dict(self):
@@ -64,33 +77,32 @@ class DownloadItem:
             status=data.get('status', 'queued'),
             error_message=data.get('error_message')
         )
-        # Simplified state restoration logic from previous version
         if item.status in ['paused', 'error', 'downloading']:
              if os.path.exists(item.progress_file):
                  try:
                      with open(item.progress_file, 'r') as pf:
                          item.downloaded_size = int(pf.read().strip())
-                     if item.status == 'downloading': # Treat interrupted as paused
+                     if item.status == 'downloading':
                          item.status = 'paused'
                  except (IOError, ValueError):
-                     # Reset if progress file is bad
+                     # logging.warning(f"Bad progress file for {item.filename}, resetting.")
                      item.downloaded_size = 0
                      item.status = 'queued'
                      if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
                      if os.path.exists(item.progress_file): os.remove(item.progress_file)
-             elif item.status != 'queued': # If progress missing but shouldn't be
+             elif item.status != 'queued':
+                 # logging.warning(f"Progress file missing for {item.filename}, resetting.")
                  item.downloaded_size = 0
                  item.status = 'queued'
                  if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
         elif item.status == 'completed':
              if not os.path.exists(item.final_filename):
+                 # logging.warning(f"Completed file missing for {item.filename}, resetting.")
                  item.status = 'queued'
                  item.downloaded_size = 0
-
         return item
 
     def __str__(self):
-        # Simplified string representation - TUI will handle progress bars
         state_upper = self.status.upper()
         if self.status == 'error':
             err_msg = f" - {self.error_message}" if self.error_message else ""
@@ -110,35 +122,30 @@ class DownloadItem:
 class DownloadManager:
     def __init__(self):
         self.download_queue = queue.Queue()
-        self.downloads = {} # {filename: DownloadItem}
+        self.downloads = {}
         self.lock = threading.Lock()
         self.worker_thread = None
         self.stop_event = threading.Event()
-
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         self.load_state()
 
     def get_items(self) -> list[DownloadItem]:
-        """ Returns a thread-safe copy of the download items list. """
         with self.lock:
-            # Return a copy to avoid race conditions during iteration in the UI
             return list(self.downloads.values())
 
     def add_download(self, url):
         item = DownloadItem(url)
-        # Prevent adding duplicates by filename
         with self.lock:
             if item.filename in self.downloads:
-                # Maybe update the URL if requested? For now, just report.
-                print(f"Download for '{item.filename}' already exists or filename conflict.")
-                return False # Indicate failure/prevention
-
+                logging.warning(f"Download for '{item.filename}' already exists.")
+                # print(f"Download for '{item.filename}' already exists or filename conflict.") # REMOVED
+                return False
             self.downloads[item.filename] = item
-
         self.download_queue.put(item)
-        print(f"Added '{item.filename}' to the queue.")
+        logging.info(f"Added '{item.filename}' to queue (URL: {url}).")
+        # print(f"Added '{item.filename}' to the queue.") # REMOVED
         self.save_state()
-        return True # Indicate success
+        return True
 
     def pause_download(self, filename):
         item_paused = False
@@ -146,18 +153,18 @@ class DownloadManager:
             item = self.downloads.get(filename)
             if item and item.status == 'downloading':
                 item.pause_event.set()
-                # Status update ('paused') is done by the worker thread
                 item_paused = True
-            # Handle other cases (already paused, not found, wrong state)
-            elif item and item.status == 'paused':
-                print(f"'{filename}' is already paused.")
-            elif item:
-                 print(f"Cannot pause '{filename}' (status: {item.status}).")
-            else:
-                print(f"Download '{filename}' not found.")
-        if item_paused:
-             print(f"Signalling pause for '{filename}'...")
-        return item_paused # Return success/failure
+            # REMOVED print statements for other conditions - TUI shows status
+            # elif item and item.status == 'paused':
+            #     print(f"'{filename}' is already paused.")
+            # elif item:
+            #      print(f"Cannot pause '{filename}' (status: {item.status}).")
+            # else:
+            #     print(f"Download '{filename}' not found.")
+        # if item_paused:
+        #      print(f"Signalling pause for '{filename}'...") # REMOVED
+        logging.info(f"Pause requested for {filename}. Success: {item_paused}")
+        return item_paused
 
     def resume_download(self, filename):
         item_resumed = False
@@ -166,38 +173,32 @@ class DownloadManager:
             if item and item.status == 'paused':
                 item.status = 'queued'
                 item.pause_event.clear()
-                # Important: Clear stop event too if it was set during pause/stop
                 item.stop_event.clear()
-                self.download_queue.put(item) # Add back to the queue
+                self.download_queue.put(item)
                 item_resumed = True
-            # Handle other cases
-            elif item and item.status == 'queued':
-                 print(f"'{filename}' is already queued.")
-            elif item and item.status == 'downloading':
-                 print(f"'{filename}' is already downloading.")
-            elif item:
-                 print(f"Cannot resume '{filename}' (status: {item.status}).")
-            else:
-                print(f"Download '{filename}' not found.")
+            # REMOVED print statements for other conditions
+            # elif item and item.status == 'queued':
+            #      print(f"'{filename}' is already queued.")
+            # ... etc ...
 
         if item_resumed:
-            print(f"Resuming '{filename}'...")
-            self.save_state() # Save status change
+            # print(f"Resuming '{filename}'...") # REMOVED
+            self.save_state()
+        logging.info(f"Resume requested for {filename}. Success: {item_resumed}")
         return item_resumed
 
     def pause_all(self):
-        """ Signals all currently downloading items to pause. """
         paused_count = 0
         with self.lock:
             for item in self.downloads.values():
                 if item.status == 'downloading':
                     item.pause_event.set()
                     paused_count += 1
-        print(f"Signalling pause for {paused_count} active download(s)...")
+        # print(f"Signalling pause for {paused_count} active download(s)...") # REMOVED
+        logging.info(f"Pause All requested. Signalled {paused_count} items.")
         return paused_count > 0
 
     def resume_all(self):
-        """ Resumes all currently paused items by re-queuing them. """
         resumed_count = 0
         items_to_queue = []
         with self.lock:
@@ -205,24 +206,23 @@ class DownloadManager:
                 if item.status == 'paused':
                     item.status = 'queued'
                     item.pause_event.clear()
-                    item.stop_event.clear() # Ensure stop is cleared
+                    item.stop_event.clear()
                     items_to_queue.append(item)
                     resumed_count += 1
 
-        # Add items to queue outside the lock to avoid potential deadlocks
-        # if queue operations block under rare circumstances.
         for item in items_to_queue:
              self.download_queue.put(item)
 
         if resumed_count > 0:
-             print(f"Resuming {resumed_count} paused download(s)...")
-             self.save_state() # Save status changes
-        else:
-             print("No paused downloads to resume.")
+             # print(f"Resuming {resumed_count} paused download(s)...") # REMOVED
+             self.save_state()
+        # else:
+        #      print("No paused downloads to resume.") # REMOVED
+        logging.info(f"Resume All requested. Resumed {resumed_count} items.")
         return resumed_count > 0
 
     def _worker(self):
-        print("Download worker started.")
+        logging.info("Download worker started.")
         while not self.stop_event.is_set():
             try:
                 item = self.download_queue.get(timeout=1)
@@ -231,335 +231,286 @@ class DownloadManager:
 
             if self.stop_event.is_set(): break
             if item.stop_event.is_set():
-                print(f"Skipping cancelled download: {item.filename}")
+                logging.info(f"Skipping cancelled download: {item.filename}")
+                # print(f"Skipping cancelled download: {item.filename}") # REMOVED
                 self.download_queue.task_done()
                 continue
             if item.status == 'completed':
-                # print(f"Skipping already completed download: {item.filename}") # Can be noisy
                 self.download_queue.task_done()
                 continue
-            # Ensure item is marked as queued if it wasn't (e.g., retrying error)
             if item.status != 'queued':
-                 with self.lock: item.status = 'queued'
+                 with self.lock: item.status = 'queued' # Ensure correct state
 
-
-            print(f"Starting download: {item.filename}")
+            logging.info(f"Starting download: {item.filename}")
+            # print(f"Starting download: {item.filename}") # REMOVED
             self._process_download(item)
             self.download_queue.task_done()
-            # Save state only after task is done (success, pause, error)
             self.save_state()
 
-        print("Download worker stopped.")
+        logging.info("Download worker stopped.")
 
     def _process_download(self, item: DownloadItem):
-        # --- Reset state for this attempt ---
         with self.lock:
              item.status = 'downloading'
              item.error_message = None
              item.pause_event.clear()
-             # Do not clear stop_event here, it might be set globally
 
         headers = {}
         current_size = 0
-        file_mode = 'wb' # Default to write, change to append if resuming
+        file_mode = 'wb'
+        session = requests.Session()
+        response = None
 
-        # --- Check for existing progress/resume ---
-        if os.path.exists(item.progress_file):
-            try:
-                with open(item.progress_file, 'r') as pf:
-                    saved_size = int(pf.read().strip())
-                # Sanity check: ensure partial file size matches progress file
-                # This handles cases where the .part file was truncated or deleted externally
-                actual_part_size = 0
-                if os.path.exists(item.temp_filename):
-                    actual_part_size = os.path.getsize(item.temp_filename)
+        try:
+            # --- Resume Logic ---
+            if os.path.exists(item.progress_file):
+                try:
+                    with open(item.progress_file, 'r') as pf: saved_size = int(pf.read().strip())
+                    actual_part_size = os.path.getsize(item.temp_filename) if os.path.exists(item.temp_filename) else 0
 
-                if actual_part_size == saved_size and saved_size > 0:
-                    current_size = saved_size
-                    item.downloaded_size = current_size
-                    headers['Range'] = f'bytes={current_size}-'
-                    file_mode = 'ab' # Append mode
-                    print(f"Resuming {item.filename} from {current_size} bytes.")
-                elif saved_size > 0:
-                    print(f"Warning: Progress file size ({saved_size}) mismatches partial file size ({actual_part_size}) for {item.filename}. Restarting download.")
-                    current_size = 0
-                    item.downloaded_size = 0
-                    # Clean up inconsistent state
+                    if actual_part_size == saved_size and saved_size > 0:
+                        current_size = saved_size
+                        item.downloaded_size = current_size
+                        headers['Range'] = f'bytes={current_size}-'
+                        file_mode = 'ab'
+                        logging.info(f"Resuming {item.filename} from {current_size} bytes.")
+                        # print(f"Resuming {item.filename} from {current_size} bytes.") # REMOVED
+                    elif saved_size > 0:
+                        logging.warning(f"Progress/part mismatch for {item.filename}. Restarting.")
+                        # print(f"Warning: Progress file size ... Restarting download.") # REMOVED
+                        current_size = 0; item.downloaded_size = 0
+                        if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
+                        if os.path.exists(item.progress_file): os.remove(item.progress_file)
+                except (IOError, ValueError) as e:
+                    logging.warning(f"Error reading progress file for {item.filename} ({e}). Restarting.")
+                    # print(f"Warning: Error reading progress file ... Restarting download.") # REMOVED
+                    current_size = 0; item.downloaded_size = 0
                     if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
                     if os.path.exists(item.progress_file): os.remove(item.progress_file)
 
-            except (IOError, ValueError) as e:
-                print(f"Warning: Error reading progress file for {item.filename} ({e}). Restarting download.")
-                current_size = 0
-                item.downloaded_size = 0
-                if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
-                if os.path.exists(item.progress_file): os.remove(item.progress_file)
-
-        # --- Perform Download ---
-        session = requests.Session() # Use session for potential keep-alive
-        response = None
-        try:
-            response = session.get(item.url, headers=headers, stream=True, timeout=30)
+            # --- Get Request ---
+            response = session.get(item.url, headers=headers, stream=True, timeout=60) # Increased timeout
             response.raise_for_status()
 
             # --- Handle Resume Response ---
             is_resuming = False
-            if current_size > 0 and response.status_code == 206: # Partial Content
+            if current_size > 0 and response.status_code == 206:
                 is_resuming = True
+                logging.info(f"Server confirmed resume for {item.filename}.")
+                # print(f"Server confirmed resume for {item.filename}.") # REMOVED - This one specifically was in the screenshot!
                 content_range = response.headers.get('Content-Range')
                 if content_range:
                     try: item.total_size = int(content_range.split('/')[-1])
-                    except (ValueError, IndexError): pass # Ignore malformed header
-                print(f"Server confirmed resume for {item.filename}.")
-            elif current_size > 0: # Requested resume, but got 200 OK or other
-                print(f"Server didn't support resume (Status: {response.status_code}). Restarting {item.filename}.")
-                current_size = 0
-                item.downloaded_size = 0
-                file_mode = 'wb' # Overwrite
+                    except (ValueError, IndexError): pass
+            elif current_size > 0:
+                logging.warning(f"Server didn't support resume (Status: {response.status_code}). Restarting {item.filename}.")
+                # print(f"Server didn't support resume ... Restarting {item.filename}.") # REMOVED
+                current_size = 0; item.downloaded_size = 0; file_mode = 'wb'
                 if os.path.exists(item.temp_filename): os.remove(item.temp_filename)
                 if os.path.exists(item.progress_file): os.remove(item.progress_file)
 
-            # --- Get Total Size (if not known or resuming didn't provide) ---
+            # --- Get Total Size ---
             if item.total_size <= 0:
                 content_length = response.headers.get('content-length')
                 if content_length:
-                    try:
-                        # If resuming, total size is current + remaining content_length
-                        item.total_size = current_size + int(content_length)
-                    except ValueError: pass # Ignore invalid content-length
-                # else: total size remains unknown (0)
+                    try: item.total_size = current_size + int(content_length)
+                    except ValueError: pass
+                else: # Size unknown
+                    logging.warning(f"Content-Length header missing for {item.filename}")
 
             # --- Download Loop ---
             last_progress_save_time = time.time()
-            # Ensure directory exists right before opening file
             os.makedirs(os.path.dirname(item.temp_filename), exist_ok=True)
 
             with open(item.temp_filename, file_mode) as f:
-                # Ensure file pointer is correct for append mode
-                if file_mode == 'ab':
-                    f.seek(current_size)
+                if file_mode == 'ab': f.seek(current_size)
 
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if not chunk: continue # filter keep-alive chunks
+                    if not chunk: continue
 
                     # --- Check for Pause/Stop ---
                     should_stop = False
                     if item.pause_event.is_set():
-                        print(f"\nPausing download via event: {item.filename}")
+                        logging.info(f"Pausing download via event: {item.filename}")
+                        # print(f"\nPausing download via event: {item.filename}") # REMOVED
                         with self.lock: item.status = 'paused'
                         should_stop = True
-                    if item.stop_event.is_set():
-                        print(f"\nStopping download via item event: {item.filename}")
-                        with self.lock: item.status = 'paused' # Treat stop as pause for resume
-                        should_stop = True
+                    # Check global stop first potentially
                     if self.stop_event.is_set():
-                        print(f"\nStopping download via global event: {item.filename}")
+                        logging.info(f"Stopping download via global event: {item.filename}")
+                        # print(f"\nStopping download via global event: {item.filename}") # REMOVED
                         with self.lock: item.status = 'paused'
                         should_stop = True
+                    elif item.stop_event.is_set(): # Check item stop if global not set
+                         logging.info(f"Stopping download via item event: {item.filename}")
+                         # print(f"\nStopping download via item event: {item.filename}") # REMOVED
+                         with self.lock: item.status = 'paused'
+                         should_stop = True
 
                     if should_stop:
-                        # Save progress before stopping
                         try:
-                            # Flush buffer before getting size? Maybe not needed.
-                            f.flush()
-                            os.fsync(f.fileno()) # Ensure data written to disk
-                            # Use f.tell() for potentially more accurate current position
+                            f.flush(); os.fsync(f.fileno())
                             final_size = f.tell()
-                            item.downloaded_size = final_size # Update item state
-                            with open(item.progress_file, 'w') as pf:
-                                pf.write(str(final_size))
-                            print(f"Saved progress ({final_size} bytes) for {item.filename} before stopping.")
+                            item.downloaded_size = final_size
+                            with open(item.progress_file, 'w') as pf: pf.write(str(final_size))
+                            logging.info(f"Saved progress ({final_size} bytes) for {item.filename} before stopping.")
+                            # print(f"Saved progress ({final_size} bytes) for {item.filename} before stopping.") # REMOVED
                         except IOError as e:
-                             print(f"\nError saving progress for {item.filename} on stop: {e}")
-                        return # Exit _process_download for this item
+                             logging.error(f"Error saving progress for {item.filename} on stop: {e}")
+                             # print(f"\nError saving progress for {item.filename} on stop: {e}") # REMOVED
+                        return # Exit _process_download
 
                     # --- Write Chunk & Update Progress ---
                     f.write(chunk)
-                    item.downloaded_size += len(chunk) # This is faster than f.tell() in loop
+                    item.downloaded_size += len(chunk)
 
                     # --- Save progress periodically ---
                     current_time = time.time()
-                    if current_time - last_progress_save_time > 5: # Save every 5 seconds
+                    if current_time - last_progress_save_time > 5:
                         try:
-                            # Flush before saving progress? Might impact performance.
-                            # Save based on tracked size, not f.tell()
                             current_tracked_size = item.downloaded_size
-                            with open(item.progress_file, 'w') as pf:
-                                pf.write(str(current_tracked_size))
+                            with open(item.progress_file, 'w') as pf: pf.write(str(current_tracked_size))
                             last_progress_save_time = current_time
                         except IOError as e:
-                            print(f"\nError saving periodic progress for {item.filename}: {e}")
-                            # Decide whether to abort on persistent save errors?
+                            logging.error(f"Error saving periodic progress for {item.filename}: {e}")
+                            # print(f"\nError saving periodic progress for {item.filename}: {e}") # REMOVED
 
             # --- Download Complete ---
-            print(f"\nDownload stream finished for {item.filename}.")
-            # Final check: ensure file size matches expected total size
+            logging.info(f"Download stream finished for {item.filename}.")
+            # print(f"\nDownload stream finished for {item.filename}.") # REMOVED
             final_downloaded_size = os.path.getsize(item.temp_filename)
-            item.downloaded_size = final_downloaded_size # Update with actual size
+            item.downloaded_size = final_downloaded_size
 
             if item.total_size > 0 and final_downloaded_size != item.total_size:
-                raise IOError(f"Download incomplete: Expected {item.total_size} bytes, got {final_downloaded_size}")
-            elif item.total_size == 0: # Size was unknown, update total_size now
+                raise IOError(f"Incomplete: Expected {item.total_size}, got {final_downloaded_size}")
+            elif item.total_size == 0:
                  item.total_size = final_downloaded_size
 
-            # Save final progress state just before rename (redundant?)
-            # try:
-            #      with open(item.progress_file, 'w') as pf: pf.write(str(item.downloaded_size))
-            # except IOError: pass # Ignore if this fails, main thing is rename
-
-            # Rename temp file to final file
             os.rename(item.temp_filename, item.final_filename)
+            if os.path.exists(item.progress_file): os.remove(item.progress_file)
 
-            # Clean up progress file
-            if os.path.exists(item.progress_file):
-                os.remove(item.progress_file)
-
-            with self.lock:
-                item.status = 'completed'
-            print(f"Download completed and verified: {item.filename}")
+            with self.lock: item.status = 'completed'
+            logging.info(f"Download completed and verified: {item.filename}")
+            # print(f"Download completed and verified: {item.filename}") # REMOVED
 
         except requests.exceptions.RequestException as e:
-            print(f"\nDownload Error ({item.filename}): {e}")
-            with self.lock:
-                item.status = 'error'
-                item.error_message = str(e)
-            # Save progress on network errors for potential resume
-            if item.downloaded_size > 0:
+            logging.error(f"Download Error ({item.filename}): {e}")
+            # print(f"\nDownload Error ({item.filename}): {e}") # REMOVED
+            with self.lock: item.status = 'error'; item.error_message = str(e)
+            if item.downloaded_size > 0: # Save progress on network errors
                 try:
                     with open(item.progress_file, 'w') as pf: pf.write(str(item.downloaded_size))
-                except IOError as ioe: print(f"Could not save progress during error for {item.filename}: {ioe}")
-
+                except IOError as ioe: logging.error(f"Could not save progress during error ({item.filename}): {ioe}")
         except IOError as e:
-            print(f"\nFile I/O Error ({item.filename}): {e}")
-            with self.lock:
-                item.status = 'error'
-                item.error_message = f"File I/O Error: {e}"
-            # Don't save progress on file write errors typically
-
+            logging.error(f"File I/O Error ({item.filename}): {e}")
+            # print(f"\nFile I/O Error ({item.filename}): {e}") # REMOVED
+            with self.lock: item.status = 'error'; item.error_message = f"File I/O Error: {e}"
         except Exception as e:
-            print(f"\nUnexpected Error ({item.filename}): {e}")
-            # Log the full traceback for unexpected errors
-            import traceback
-            traceback.print_exc()
-            with self.lock:
-                item.status = 'error'
-                item.error_message = f"Unexpected Error: {e}"
-            # Attempt to save progress
-            if item.downloaded_size > 0:
+            logging.exception(f"Unexpected Error ({item.filename}): {e}") # Log full traceback
+            # print(f"\nUnexpected Error ({item.filename}): {e}") # REMOVED
+            with self.lock: item.status = 'error'; item.error_message = f"Unexpected Error: {e}"
+            if item.downloaded_size > 0: # Try save progress
                  try:
                       with open(item.progress_file, 'w') as pf: pf.write(str(item.downloaded_size))
-                 except IOError as ioe: print(f"Could not save progress during error for {item.filename}: {ioe}")
-
+                 except IOError as ioe: logging.error(f"Could not save progress during error ({item.filename}): {ioe}")
         finally:
-            # Ensure response is closed if it was opened
-            if response:
-                response.close()
-            # Ensure session is closed? Typically not needed per request.
-            # session.close()
+            if response: response.close()
 
     def start(self):
         if self.worker_thread and self.worker_thread.is_alive():
-            print("Worker thread already running.")
+            logging.warning("Start called but worker thread already running.")
+            # print("Worker thread already running.") # REMOVED
             return
 
+        logging.info("Starting Download Manager...")
         self.stop_event.clear()
         items_to_queue_on_start = []
         with self.lock:
             for item in self.downloads.values():
-                # If state is paused, error, or was downloading (interrupted) -> queue it
                 if item.status in ['paused', 'error']:
-                    item.status = 'queued' # Mark for queueing
+                    item.status = 'queued'
                     item.pause_event.clear()
                     item.stop_event.clear()
                     items_to_queue_on_start.append(item)
-                # No need to explicitly handle 'downloading' as from_dict converts it to 'paused'
 
-        # Add to queue outside lock
         for item in items_to_queue_on_start:
              self.download_queue.put(item)
         if items_to_queue_on_start:
-             print(f"Queued {len(items_to_queue_on_start)} pending downloads on start.")
-             self.save_state() # Save the status change to 'queued'
+             logging.info(f"Queued {len(items_to_queue_on_start)} pending downloads on start.")
+             # print(f"Queued {len(items_to_queue_on_start)} pending downloads on start.") # REMOVED
+             self.save_state()
 
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread = threading.Thread(target=self._worker, name="DownloadWorker", daemon=True) # Added name
         self.worker_thread.start()
 
     def stop(self, graceful=True):
-        print("Stopping download manager...")
+        logging.info(f"Stopping download manager (graceful={graceful})...")
+        # print("Stopping download manager...") # REMOVED
         if not self.worker_thread or not self.worker_thread.is_alive():
-            print("Worker thread not running.")
-            # Still save state even if worker wasn't running
+            logging.warning("Stop called but worker thread not running.")
+            # print("Worker thread not running.") # REMOVED
             self.save_state()
             return
 
-        self.stop_event.set() # Signal global stop
-
-        # Signal currently downloading item to stop/pause
+        self.stop_event.set()
         active_item_signalled = False
         with self.lock:
             for item in self.downloads.values():
                 if item.status == 'downloading':
-                    print(f"Signalling active download '{item.filename}' to stop...")
-                    item.stop_event.set() # Signal specific item
+                    logging.info(f"Signalling active download '{item.filename}' to stop...")
+                    # print(f"Signalling active download '{item.filename}' to stop...") # REMOVED
+                    item.stop_event.set()
                     active_item_signalled = True
-                    # Don't break, signal all active ones if multi-download is ever added
 
-        if graceful and active_item_signalled:
-            print("Waiting for worker thread to finish current task gracefully...")
-            # Give worker time to save progress and exit loop iteration
-            self.worker_thread.join(timeout=10) # Wait up to 10 seconds
+        if graceful and (active_item_signalled or not self.download_queue.empty()): # Also wait if queue isn't empty? No, worker exit depends on active task finishing
+            logging.info("Waiting for worker thread to finish current task gracefully...")
+            # print("Waiting for worker thread to finish current task gracefully...") # REMOVED
+            self.worker_thread.join(timeout=10)
             if self.worker_thread.is_alive():
-                 print("Worker thread did not stop gracefully in time.")
+                 logging.warning("Worker thread did not stop gracefully in time.")
+                 # print("Worker thread did not stop gracefully in time.") # REMOVED
             else:
-                 print("Worker thread stopped.")
+                 logging.info("Worker thread stopped.")
+                 # print("Worker thread stopped.") # REMOVED
         elif graceful:
-             # If no active download, worker should stop quickly
-             self.worker_thread.join(timeout=2)
+             self.worker_thread.join(timeout=2) # Shorter timeout if no active task
 
-
-        # Ensure final state is saved
-        print("Saving final state...")
-        self.save_state() # Save state after stopping attempt
-        print("Download manager stop sequence complete.")
-
+        logging.info("Saving final state...")
+        # print("Saving final state...") # REMOVED
+        self.save_state()
+        logging.info("Download manager stop sequence complete.")
+        # print("Download manager stop sequence complete.") # REMOVED
 
     def save_state(self):
         with self.lock:
-            # Create a snapshot of the state within the lock
-            state = {
-                'downloads': [item.to_dict() for item in self.downloads.values()]
-            }
+            state = {'downloads': [item.to_dict() for item in self.downloads.values()]}
         try:
-            # Write state outside the lock
             with open(STATE_FILE, 'w') as f:
                 json.dump(state, f, indent=4)
         except IOError as e:
-            print(f"Error saving state to {STATE_FILE}: {e}")
+            logging.error(f"Error saving state to {STATE_FILE}: {e}")
+            # print(f"Error saving state to {STATE_FILE}: {e}") # REMOVED
 
     def load_state(self):
         if not os.path.exists(STATE_FILE):
-            print("No previous state file found.")
+            logging.info("No previous state file found.")
+            # print("No previous state file found.") # REMOVED
             return
-
+        logging.info(f"Loading state from {STATE_FILE}")
         try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-
+            with open(STATE_FILE, 'r') as f: state = json.load(f)
             loaded_downloads = {}
             for item_data in state.get('downloads', []):
                  try:
                     item = DownloadItem.from_dict(item_data)
-                    # Avoid overwriting if filename collision happens during load?
-                    # Or just let the last one win.
                     loaded_downloads[item.filename] = item
                  except Exception as e:
-                      print(f"Error loading item state for {item_data.get('url')}. Error: {e}")
+                      logging.error(f"Error loading item state for {item_data.get('url')}. Error: {e}")
 
-            with self.lock:
-                 self.downloads = loaded_downloads
-
-            print(f"Loaded {len(self.downloads)} download states from {STATE_FILE}.")
-
+            with self.lock: self.downloads = loaded_downloads
+            logging.info(f"Loaded {len(self.downloads)} download states.")
+            # print(f"Loaded {len(self.downloads)} download states from {STATE_FILE}.") # REMOVED
         except (IOError, json.JSONDecodeError) as e:
-            print(f"Error loading state from {STATE_FILE}: {e}. Starting fresh.")
-            self.downloads = {} # Start fresh if state is corrupt
+            logging.error(f"Error loading state from {STATE_FILE}: {e}. Starting fresh.")
+            # print(f"Error loading state from {STATE_FILE}: {e}. Starting fresh.") # REMOVED
+            self.downloads = {}
