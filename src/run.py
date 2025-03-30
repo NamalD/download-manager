@@ -270,12 +270,11 @@ input_area = ConditionalContainer(
     filter=Condition(lambda: current_input_mode != InputMode.COMMAND)
 )
 
-root_container = HSplit([
+root_container = HSplit(children=[
     download_list_window,
-    Window(height=1, char='─', style='class:separator'),
     input_area,
     status_bar_window
-])
+    ], padding_char='-', padding=1, padding_style='class:separator')
 
 layout = Layout(root_container, focused_element=download_list_window)
 
