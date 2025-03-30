@@ -2,22 +2,39 @@ import sys
 import os
 import signal
 import asyncio
-from typing import List
+from enum import Enum, auto
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign, ConditionalContainer
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.filters import HasFocus, Condition
 
-from download_manager import DownloadManager, DownloadItem 
+# Import the DownloadManager from the other file
+try:
+    from download_manager import DownloadManager, DownloadItem
+except ImportError:
+    print("Error: Could not find download_manager.py.")
+    print("Please ensure it's in the same directory as run.py.")
+    sys.exit(1)
 
-# --- Global Variables ---
+# --- Global Variables & State ---
 manager = DownloadManager()
-status_message = "Ready. Commands: add <url>, pause <fn>, resume <fn>, list, exit/quit/q"
 last_exception = None # To display errors briefly
+
+# Enum to track the current input mode
+class InputMode(Enum):
+    COMMAND = auto() # Waiting for a command key (a, p, r, l, q)
+    ENTERING_URL = auto()
+    ENTERING_PAUSE_FILENAME = auto()
+    ENTERING_RESUME_FILENAME = auto()
+
+current_input_mode = InputMode.COMMAND
+status_message = "Keys: [a]dd [p]ause [r]esume [l]ist [q]uit | Esc to cancel input"
+prompt_message = "" # Message shown above input field
 
 # --- UI Content Functions ---
 
@@ -25,145 +42,208 @@ def get_download_list_content():
     """ Returns FormattedTextList for the download status window. """
     global last_exception
     try:
-        # Use the existing get_status method, but wrap its output in ANSI
-        # for prompt_toolkit compatibility if it contained raw escape codes.
-        # If get_status just returns plain text, ANSI() is fine.
         status_str = manager.get_status()
-        # Ensure list updates if an exception occurred previously
         if last_exception:
-           status_str += f"\n\nError processing command: {last_exception}"
-           last_exception = None # Clear after displaying once
-        return ANSI(status_str) # Use ANSI to handle potential raw strings safely
+           status_str += f"\n\nError processing input: {last_exception}"
+           last_exception = None
+        return ANSI(status_str)
     except Exception as e:
-        # Avoid crashing the UI if get_status fails, display error instead
         last_exception = e
         return ANSI(f"Error retrieving status: {e}")
 
+def get_prompt_message_content():
+    """ Returns text for the prompt line above the input field. """
+    return ANSI(prompt_message)
+
 def get_status_bar_content():
     """ Returns FormattedTextList for the bottom status bar. """
-    # Display the persistent status message
-    # Could potentially add dynamic info here later (e.g., total speed)
     return ANSI(status_message)
+
+# --- Input Buffer ---
+# This buffer will be used when prompting for URL or filename
+input_buffer = Buffer()
 
 # --- Key Bindings ---
 bindings = KeyBindings()
 
-@bindings.add('c-c')
-@bindings.add('c-q')
+def reset_input_state():
+    """ Reset state after command execution or cancellation. """
+    global current_input_mode, prompt_message
+    input_buffer.reset()
+    current_input_mode = InputMode.COMMAND
+    prompt_message = ""
+    # Ensure focus leaves the input buffer if it's not needed
+    # We might need to explicitly set focus back to a non-input area if desired
+    # For now, focus stays where it is, but the input field might hide.
+
+
+# --- Global Command Keys (available when InputMode is COMMAND) ---
+
+@bindings.add('a', filter=Condition(lambda: current_input_mode == InputMode.COMMAND))
 def _(event):
-    """ Exit application on Ctrl+C or Ctrl+Q. """
-    print("\nCtrl+C/Q detected. Stopping manager and exiting...")
-    manager.stop(graceful=True) # Attempt graceful shutdown
-    event.app.exit()
+    """ 'a' pressed: Prepare to enter URL. """
+    global current_input_mode, prompt_message, status_message
+    current_input_mode = InputMode.ENTERING_URL
+    prompt_message = "Enter URL to add:"
+    status_message = "Type URL and press Enter. Esc to cancel."
+    input_buffer.reset()
+    event.app.layout.focus(input_window) # Focus the input field
 
-# --- Input Buffer Handling ---
-input_buffer = Buffer() # We don't assign accept_handler here, handle in 'enter' binding
+@bindings.add('p', filter=Condition(lambda: current_input_mode == InputMode.COMMAND))
+def _(event):
+    """ 'p' pressed: Prepare to enter filename to pause. """
+    global current_input_mode, prompt_message, status_message
+    current_input_mode = InputMode.ENTERING_PAUSE_FILENAME
+    prompt_message = "Enter filename to PAUSE:"
+    status_message = "Type filename and press Enter. Esc to cancel."
+    input_buffer.reset()
+    event.app.layout.focus(input_window)
 
-def handle_command(command_text: str):
-    """ Parses and executes commands entered by the user. """
+@bindings.add('r', filter=Condition(lambda: current_input_mode == InputMode.COMMAND))
+def _(event):
+    """ 'r' pressed: Prepare to enter filename to resume. """
+    global current_input_mode, prompt_message, status_message
+    current_input_mode = InputMode.ENTERING_RESUME_FILENAME
+    prompt_message = "Enter filename to RESUME:"
+    status_message = "Type filename and press Enter. Esc to cancel."
+    input_buffer.reset()
+    event.app.layout.focus(input_window)
+
+@bindings.add('l', filter=Condition(lambda: current_input_mode == InputMode.COMMAND))
+def _(event):
+    """ 'l' pressed: Refresh status message (list updates automatically). """
+    global status_message
+    status_message = "Download list updated. Keys: [a]dd [p]ause [r]esume [l]ist [q]uit"
+    # No need to change mode or focus
+
+@bindings.add('q', filter=Condition(lambda: current_input_mode == InputMode.COMMAND))
+@bindings.add('c-c') # Keep Ctrl+C as global exit
+@bindings.add('c-q') # Keep Ctrl+Q as global exit
+def _(event):
+    """ 'q', Ctrl+C, Ctrl+Q pressed: Exit application. """
+    print("\nExit requested. Stopping manager...")
+    global status_message
+    status_message = "Exiting..."
+    manager.stop(graceful=True)
+    # Schedule exit via the event loop
+    loop = asyncio.get_event_loop()
+    # Use call_soon_threadsafe if stopping from a different thread context
+    # If called directly from prompt_toolkit event, call_soon should work
+    loop.call_soon(lambda: asyncio.ensure_future(app.cancel()))
+
+
+# --- Input Field Keys (available when focused and not in COMMAND mode) ---
+
+@bindings.add('enter', filter=HasFocus(input_buffer) & Condition(lambda: current_input_mode != InputMode.COMMAND))
+def _(event):
+    """ Enter pressed in input field: process the entered text. """
     global status_message, last_exception
-    last_exception = None # Clear previous error on new command
-    command_parts = command_text.strip().split()
-    if not command_parts:
-        return
-
-    action = command_parts[0].lower()
+    entered_text = input_buffer.text.strip()
+    last_exception = None # Clear previous error
 
     try:
-        if action in ["exit", "quit", "q"]:
-            manager.stop(graceful=True)
-            # Find the application instance to exit it
-            # This is a bit indirect, usually you'd have app access in event handlers
-            # A workaround is to schedule the exit via the loop
-            loop = asyncio.get_event_loop()
-            loop.call_soon(lambda: asyncio.ensure_future(app.exit())) # Schedule exit
-            status_message = "Exiting..."
-
-        elif action == "add" and len(command_parts) > 1:
-            url = command_parts[1]
-            manager.add_download(url)
-            status_message = f"Added '{url[:50]}{'...' if len(url)>50 else ''}' to queue."
-
-        elif action == "pause" and len(command_parts) > 1:
-            filename = " ".join(command_parts[1:])
-            if manager.pause_download(filename):
-                status_message = f"Attempting to pause '{filename}'..."
+        if current_input_mode == InputMode.ENTERING_URL:
+            if entered_text:
+                manager.add_download(entered_text)
+                status_message = f"Added '{entered_text[:50]}{'...' if len(entered_text)>50 else ''}'."
             else:
-                # pause_download prints its own messages for failures
-                item = manager.downloads.get(filename)
-                if item:
-                    status_message = f"Could not pause '{filename}' (status: {item.status})."
+                status_message = "Add cancelled (no URL entered)."
+
+        elif current_input_mode == InputMode.ENTERING_PAUSE_FILENAME:
+            if entered_text:
+                if manager.pause_download(entered_text):
+                    status_message = f"Attempting to pause '{entered_text}'..."
                 else:
-                    status_message = f"Download '{filename}' not found."
-
-
-        elif action == "resume" and len(command_parts) > 1:
-            filename = " ".join(command_parts[1:])
-            if manager.resume_download(filename):
-                status_message = f"Resuming '{filename}'..."
+                     # pause_download prints details, set a general message here
+                     item = manager.downloads.get(entered_text)
+                     if item: status_message = f"Could not pause '{entered_text}' (status: {item.status})."
+                     else: status_message = f"Download '{entered_text}' not found for pausing."
             else:
-                # resume_download prints its own messages for failures
-                 item = manager.downloads.get(filename)
-                 if item:
-                    status_message = f"Could not resume '{filename}' (status: {item.status})."
-                 else:
-                    status_message = f"Download '{filename}' not found."
+                status_message = "Pause cancelled (no filename entered)."
 
-        elif action == "list":
-            # List is always displayed, this command is redundant but harmless
-            status_message = "Displaying download list."
-
-        else:
-            status_message = f"Unknown command: '{action}'. Use: add, pause, resume, list, exit"
+        elif current_input_mode == InputMode.ENTERING_RESUME_FILENAME:
+            if entered_text:
+                if manager.resume_download(entered_text):
+                    status_message = f"Attempting to resume '{entered_text}'..."
+                else:
+                     # resume_download prints details
+                     item = manager.downloads.get(entered_text)
+                     if item: status_message = f"Could not resume '{entered_text}' (status: {item.status})."
+                     else: status_message = f"Download '{entered_text}' not found for resuming."
+            else:
+                status_message = "Resume cancelled (no filename entered)."
 
     except Exception as e:
-        print(f"\nError processing command '{command_text}': {e}") # Also print to console for debug
+        print(f"\nError processing input '{entered_text}': {e}")
         status_message = f"Error: {e}"
-        last_exception = e # Store for display in main window
+        last_exception = e
+
+    reset_input_state()
+    # Optionally focus back to the main area after command execution
+    # event.app.layout.focus(download_list_window) # Example
 
 
-# Bind Enter key to handle the command
-@bindings.add('enter')
+@bindings.add('escape', filter=HasFocus(input_buffer) | Condition(lambda: current_input_mode != InputMode.COMMAND))
 def _(event):
-    """ Handle command submission when Enter is pressed. """
-    command = input_buffer.text
-    handle_command(command)
-    input_buffer.reset() # Clear the input buffer
+    """ Escape pressed: Cancel current input mode. """
+    global status_message
+    status_message = "Input cancelled. Keys: [a]dd [p]ause [r]esume [l]ist [q]uit"
+    reset_input_state()
+    # Optionally focus back to the main area
+    # event.app.layout.focus(download_list_window) # Example
+
 
 # --- Layout Definition ---
 
 # Window to display the download list
 download_list_window = Window(
-    content=FormattedTextControl(text=get_download_list_content),
+    content=FormattedTextControl(text=get_download_list_content, focusable=True), # Make focusable
     wrap_lines=True
 )
 
-# Window for the user input command line
-input_window = Window(
-    content=BufferControl(buffer=input_buffer),
+# Window for the prompt message (only visible when needed)
+prompt_message_window = Window(
+    content=FormattedTextControl(text=get_prompt_message_content),
     height=1,
-    style="class:input-field" # Optional styling
+    style="class:prompt-message",
+    align=WindowAlign.LEFT
+)
+
+# Window for the user input (URL or filename)
+input_window = Window(
+    content=BufferControl(buffer=input_buffer, focusable=True), # Make focusable
+    height=1,
+    style="class:input-field"
 )
 
 # Window for the status bar at the bottom
 status_bar_window = Window(
     content=FormattedTextControl(text=get_status_bar_content),
     height=1,
-    style="class:status-bar", # Optional styling
+    style="class:status-bar",
     align=WindowAlign.LEFT
 )
 
-# Horizontal split layout
+# Conditional container for the prompt + input field
+# Only show these when not in COMMAND mode
+input_area = ConditionalContainer(
+    content=HSplit([
+        prompt_message_window,
+        input_window,
+    ]),
+    filter=Condition(lambda: current_input_mode != InputMode.COMMAND)
+)
+
+# Main layout
 root_container = HSplit([
     download_list_window,       # Main content area
     Window(height=1, char='-', style='class:separator'), # Separator line
-    Window(height=1, char='-', style='class:separator'), # Separator line
-    input_window,               # Command input line
-    status_bar_window,           # Status message line
+    input_area,                 # Prompt and Input (conditional)
+    status_bar_window           # Status message line (always visible)
 ])
 
-# Create the layout
-layout = Layout(root_container, focused_element=input_window) # Focus input field initially
+# Create the layout - focus the main list initially
+layout = Layout(root_container, focused_element=download_list_window)
 
 
 # --- Application Setup ---
@@ -171,46 +251,40 @@ app = Application(
     layout=layout,
     key_bindings=bindings,
     full_screen=True,
-    mouse_support=True, # Enable mouse support (optional)
-    refresh_interval=0.5 # Refresh the UI every 0.5 seconds to update status
+    mouse_support=True,
+    refresh_interval=0.5 # Refresh UI for status updates
 )
 
-# --- Signal Handling for Graceful Exit (Alternative/Robust) ---
+# --- Signal Handling & Main Execution (mostly unchanged) ---
 def handle_sigterm(signum, frame):
     """ Handle SIGTERM signal for graceful shutdown. """
     print("\nSIGTERM received. Stopping manager and exiting...")
+    global status_message
+    status_message = "SIGTERM received, exiting..." # Update UI briefly if possible
     manager.stop(graceful=True)
-     # Ensure the application event loop stops cleanly
     try:
         loop = asyncio.get_running_loop()
-        # Schedule the exit call within the loop's context
         loop.call_soon_threadsafe(lambda: asyncio.ensure_future(app.cancel()))
-    except RuntimeError: # Loop not running
-        sys.exit(1) # Exit directly if loop isn't running
+    except RuntimeError:
+        sys.exit(1)
 
-# --- Main Execution ---
 async def main():
     """ Asynchronous main function to run the application. """
-    # Register signal handlers
-    # SIGINT is usually handled by prompt_toolkit's default ctrl-c binding
-    # Register SIGTERM for system shutdowns
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGTERM, handle_sigterm, signal.SIGTERM, None)
 
     print("Starting download manager worker...")
-    manager.start() # Start the background download worker
+    manager.start()
 
     print("Launching TUI...")
-    await app.run_async() # Run the prompt_toolkit application
+    await app.run_async()
 
     print("TUI exited. Final shutdown.")
-    # Ensure manager is stopped if not already done by exit command/signal
     if manager.worker_thread and manager.worker_thread.is_alive():
-         manager.stop(graceful=True)
+         manager.stop(graceful=True) # Ensure stop on exit
 
 
 if __name__ == "__main__":
-    # Setup basic logging or print statements if needed before TUI starts
     if sys.platform == "win32":
          asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -218,7 +292,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt caught in main. Exiting.")
-        # Ensure manager stop is called even if TUI crashes or is force-quit
-        manager.stop(graceful=False) # Non-graceful stop might be needed here
+        manager.stop(graceful=False)
     finally:
         print("Application finished.")
